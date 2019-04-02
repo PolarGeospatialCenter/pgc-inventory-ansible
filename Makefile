@@ -1,2 +1,2 @@
 test:
-	go build .
+	go build --mod=readonly .
