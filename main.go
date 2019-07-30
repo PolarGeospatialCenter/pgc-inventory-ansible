@@ -5,12 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/url"
 
 	"github.com/PolarGeospatialCenter/inventory-client/pkg/api/client"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/spf13/viper"
+	"github.com/PolarGeospatialCenter/inventory/pkg/inventory/types"
 )
 
 type AnsibleGroup struct {
@@ -33,26 +30,90 @@ func (g *AnsibleGroup) AddHost(hostname string) {
 	g.Hosts = append(g.Hosts, hostname)
 }
 
-func main() {
+type AnsibleHost types.InventoryNode
 
-	cfg := viper.New()
-	cfg.AddConfigPath(".")
-	cfg.SetConfigName("pgc-inventory")
-	cfg.SetDefault("aws.region", "us-east-2")
-	cfg.SetDefault("aws.profile", "default")
-	cfg.ReadInConfig()
+func (h AnsibleHost) AnsibleHostAlias() (string, error) {
+	return h.Hostname, nil
+}
 
-	awsConfig := &aws.Config{}
-	awsConfig.WithRegion(cfg.GetString("aws.region"))
-	awsConfig.WithCredentials(credentials.NewSharedCredentials("", cfg.GetString("aws.profile")))
+// AnsibleConnectionData returns ansible_fqdn, ansible_host and ansible_port host vars
+func (h AnsibleHost) AnsibleConnectionData() (string, string, string, error) {
+	var domain string
+	var ipAddr net.IP
 
-	baseUrlString := cfg.GetString("baseurl")
-	baseUrl, err := url.Parse(baseUrlString)
-	if err != nil {
-		log.Fatalf("unable to parse api base url '%s': %v", baseUrlString, err)
+	for _, network := range h.Networks {
+		conf := network.Config
+		for i, gw := range conf.Gateway {
+			if gwIP := net.ParseIP(gw); gwIP != nil {
+				ip, _, err := net.ParseCIDR(conf.IP[i])
+				if err == nil {
+					ipAddr = ip
+				}
+				domain = network.Network.Domain
+			}
+		}
 	}
 
-	nodes, err := client.NewInventoryApi(baseUrl, awsConfig).NodeConfig().GetAll()
+	var fqdn, host, port string
+	if domain != "" {
+		fqdn = fmt.Sprintf("%s.%s", h.Hostname, domain)
+	}
+
+	switch {
+	case fqdn != "":
+		host = fqdn
+	case ipAddr != nil:
+		host = ipAddr.String()
+	default:
+		host = h.Hostname
+	}
+
+	port = "22"
+
+	return fqdn, host, port, nil
+}
+
+func (h AnsibleHost) AnsibleGroups() ([]string, error) {
+	groups := make([]string, 0)
+	groups = append(groups, h.System.ID())
+	groups = append(groups, fmt.Sprintf("%s-%s", h.System.ID(), h.Role))
+	return groups, nil
+}
+
+func (h AnsibleHost) AnsibleHostVars() (map[string]interface{}, error) {
+	hostVars := make(map[string]interface{})
+	hostVars["ansible_python_interpreter"] = "/opt/ansible/bin/python"
+	hostVars["tags"] = h.Tags
+	hostVars["inventory_id"] = h.InventoryID
+	hostVars["rack"] = h.Location.Rack
+	hostVars["role"] = h.Role
+	hostVars["last_update"] = h.LastUpdated
+	hostVars["nodeconfig"] = h
+	fqdn, host, port, err := h.AnsibleConnectionData()
+	if err != nil {
+		return nil, err
+	}
+	hostVars["ansible_fqdn"] = fqdn
+	hostVars["ansible_host"] = host
+	hostVars["ansible_port"] = port
+	if cpNetworkName, ok := h.Environment.Metadata["kubernetes_control_plane_network"].(string); ok {
+		if cpNetwork, ok := h.Networks[cpNetworkName]; ok {
+			hostVars["kube_control_plane_domain"] = cpNetwork.Network.Domain
+			hostVars["kube_control_plane_ips"] = make([]string, 0, len(cpNetwork.Config.IP))
+			for _, ipString := range cpNetwork.Config.IP {
+				ip, _, err := net.ParseCIDR(ipString)
+				if err == nil {
+					hostVars["kube_control_plane_ips"] = append(hostVars["kube_control_plane_ips"].([]string), ip.String())
+				}
+			}
+		}
+	}
+	return hostVars, nil
+}
+
+func main() {
+	apiClient, _ := client.NewInventoryApiDefaultConfig("default")
+	nodes, err := apiClient.NodeConfig().GetAll()
 	if err != nil {
 		log.Fatalf("Unable to read nodes: %v", err)
 	}
@@ -61,42 +122,28 @@ func main() {
 	hostVars := make(map[string]map[string]interface{})
 
 	for _, node := range nodes {
-		var domain string
-		if provNet, ok := node.Networks["provisioning"]; ok {
-			domain = provNet.Network.Domain
-		}
-		if cpNetworkName, ok := node.Environment.Metadata["kubernetes_control_plane_network"].(string); ok {
-			if cpNetwork, ok := node.Networks[cpNetworkName]; ok {
-				domain = cpNetwork.Network.Domain
-			}
+		ansibleNode := AnsibleHost(*node)
+		alias, err := ansibleNode.AnsibleHostAlias()
+		if err != nil {
+			// Unable to get fqdn, how to fallback?
+			log.Printf("Unable to get FQDN for node %s: %v", node.ID(), err)
+			continue
 		}
 
-		fqdn := fmt.Sprintf("%s.%s", node.Hostname, domain)
-		group := groups.Get(node.System.ID())
-		group.AddHost(fqdn)
-		roleGroup := fmt.Sprintf("%s-%s", node.System.ID(), node.Role)
-		group = groups.Get(roleGroup)
-		groups[roleGroup].AddHost(fqdn)
-		hostVars[fqdn] = make(map[string]interface{})
-		hostVars[fqdn]["ansible_python_interpreter"] = "/opt/ansible/bin/python"
-		hostVars[fqdn]["tags"] = node.Tags
-		hostVars[fqdn]["inventory_id"] = node.ID()
-		hostVars[fqdn]["rack"] = node.Location.Rack
-		hostVars[fqdn]["role"] = node.Role
-		hostVars[fqdn]["last_update"] = node.LastUpdated
-		hostVars[fqdn]["nodeconfig"] = node
-		if cpNetworkName, ok := node.Environment.Metadata["kubernetes_control_plane_network"].(string); ok {
-			if cpNetwork, ok := node.Networks[cpNetworkName]; ok {
-				hostVars[fqdn]["kube_control_plane_domain"] = cpNetwork.Network.Domain
-				hostVars[fqdn]["kube_control_plane_ips"] = make([]string, 0, len(cpNetwork.Config.IP))
-				for _, ipString := range cpNetwork.Config.IP {
-					ip, _, err := net.ParseCIDR(ipString)
-					if err == nil {
-						hostVars[fqdn]["kube_control_plane_ips"] = append(hostVars[fqdn]["kube_control_plane_ips"].([]string), ip.String())
-					}
-				}
-			}
+		hostGroups, err := ansibleNode.AnsibleGroups()
+		if err != nil {
+			log.Printf("Unable to get groups for node %s: %v", node.ID(), err)
 		}
+		for _, groupName := range hostGroups {
+			group := groups.Get(groupName)
+			group.AddHost(alias)
+		}
+
+		vars, err := ansibleNode.AnsibleHostVars()
+		if err != nil {
+			log.Printf("Unable to get vars for host %s: %v", node.ID(), err)
+		}
+		hostVars[alias] = vars
 	}
 
 	result := make(map[string]interface{})
