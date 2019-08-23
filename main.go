@@ -82,7 +82,6 @@ func (h AnsibleHost) AnsibleGroups() ([]string, error) {
 
 func (h AnsibleHost) AnsibleHostVars() (map[string]interface{}, error) {
 	hostVars := make(map[string]interface{})
-	hostVars["ansible_python_interpreter"] = "/opt/ansible/bin/python"
 	hostVars["tags"] = h.Tags
 	hostVars["inventory_id"] = h.InventoryID
 	hostVars["rack"] = h.Location.Rack
